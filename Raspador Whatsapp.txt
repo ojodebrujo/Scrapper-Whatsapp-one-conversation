@@ -1,0 +1,97 @@
+(function(){
+  ['__timer','__waTimer','__waAuto'].forEach(k=>clearInterval(window[k]));
+  if(window.__waPanel) window.__waPanel.remove();
+  window.__msgs=[]; window.__seen=new Set(); window.__cf=0; window.__sf=0; window.__lastF='';
+  const RX=/^\[([^,\]]+),\s*([^\]]+)\]\s*(.*?):\s*$/;
+
+  function main(){ return document.querySelector('#main'); }
+  function titulo(){ const m=main(); if(!m) return ''; const h=m.querySelector('header');
+    return h ? (h.innerText||'').split('\n')[0].trim() : ''; }
+  window.__lock = titulo();
+
+  function meta(row){
+    const el=row.matches('[data-pre-plain-text]')?row:row.querySelector('[data-pre-plain-text]');
+    if(!el) return null;
+    const m=(el.getAttribute('data-pre-plain-text')||'').match(RX);
+    return m?{fecha:m[2].trim()}:null;
+  }
+  function capturar(){
+    try{
+      const m=main(); if(!m){ st('abre el grupo primero'); return; }
+      const t=titulo();
+      if(window.__lock && t && t!==window.__lock){
+        clearInterval(window.__waAuto); running=false;
+        const b=document.getElementById('__waAutoBtn'); if(b) b.textContent='▶ Auto-scroll';
+        st('⛔ cambió el chat — DETENIDO'); info('abriste otro chat. Vuelve al grupo "'+window.__lock+'".'); return;
+      }
+      const rows=m.querySelectorAll('div[role="row"]'); if(!rows.length) return;
+      const nuevos=[];
+      rows.forEach(row=>{ try{
+        const raw=row.innerText && row.innerText.trim();
+        if(!raw || window.__seen.has(raw)) return;
+        window.__seen.add(raw);
+        const mt=meta(row); let f;
+        if(mt && mt.fecha){ f=mt.fecha; window.__lastF=f; window.__cf++; }
+        else { f=window.__lastF||'??'; window.__sf++; }
+        nuevos.push('['+f+'] '+raw.replace(/\n+/g,' · '));
+      }catch(e){} });
+      if(nuevos.length) window.__msgs=nuevos.concat(window.__msgs);
+      const c=document.getElementById('__waCount'); if(c) c.textContent='Capturados: '+window.__seen.size;
+      const d=document.getElementById('__waCF'); if(d) d.textContent='Con fecha: '+window.__cf+'  ·  Sin: '+window.__sf;
+    }catch(e){}
+  }
+  function wheel(dir){ const m=main(); if(!m) return; const el=m.querySelector('div[role="row"]'); if(!el) return;
+    (el.parentElement||el).dispatchEvent(new WheelEvent('wheel',{deltaY:dir*320,bubbles:true,cancelable:true})); }
+  function banner(){ const m=main(); if(!m) return false;
+    const b=[...m.querySelectorAll('div[role="button"],button,span,div')]
+    .find(x=>/mensajes anteriores|obtener mensajes|older messages|click here to get/i.test((x.textContent||'').slice(0,100)));
+    if(b){ b.click(); return true; } return false; }
+  function cargando(){ const m=main(); return m ? !!m.querySelector('[role="progressbar"]') : false; }
+
+  const p=document.createElement('div'); p.id='__waPanel'; window.__waPanel=p;
+  p.style.cssText='position:fixed;top:80px;right:24px;z-index:2147483647;background:#111;color:#0f0;padding:16px;border-radius:12px;font-family:monospace;font-size:15px;box-shadow:0 6px 24px rgba(0,0,0,.6);text-align:center;min-width:250px;';
+  p.innerHTML='<div id="__waLock" style="font-size:11px;color:#6cf;margin-bottom:4px;">🔒 '+(window.__lock||'(sin chat)')+'</div>'+
+    '<div id="__waCount" style="font-size:22px;">Capturados: 0</div>'+
+    '<div id="__waCF" style="font-size:13px;color:#ff0;margin-bottom:6px;">Con fecha: 0  ·  Sin: 0</div>'+
+    '<div id="__waStatus" style="font-size:12px;color:#7f7;margin-bottom:4px;min-height:16px;">listo</div>'+
+    '<div id="__waInfo" style="font-size:11px;color:#999;margin-bottom:12px;min-height:24px;line-height:1.3;"></div>'+
+    '<button id="__waAutoBtn" style="background:#06c;color:#fff;border:none;padding:10px 14px;border-radius:8px;font-size:14px;cursor:pointer;margin-bottom:8px;width:100%;">▶ Auto-scroll</button>'+
+    '<button id="__waBtn" style="background:#0a7;color:#fff;border:none;padding:10px 14px;border-radius:8px;font-size:14px;cursor:pointer;width:100%;">⬇ Descargar .txt</button>';
+  document.body.appendChild(p);
+  const st=t=>{const s=document.getElementById('__waStatus'); if(s) s.textContent=t;};
+  const info=t=>{const s=document.getElementById('__waInfo'); if(s) s.textContent=t;};
+
+  window.__waTimer=setInterval(capturar,500);
+  let running=false, mode='normal', stall=0, pre=0, wait=0; const MS=6, MW=8;
+  function stop(m,e){ clearInterval(window.__waAuto); running=false; mode='normal';
+    const b=document.getElementById('__waAutoBtn'); if(b) b.textContent='▶ Auto-scroll'; st(m); if(e) info(e); }
+  function paso(){ try{
+    const m=main(); if(!m){ st('abre el grupo'); return; }
+    const rows=m.querySelectorAll('div[role="row"]'); if(!rows.length){ st('no veo mensajes'); return; }
+    const antes=window.__seen.size;
+    if(mode==='normal'){ rows[0].scrollIntoView({block:'start'}); capturar();
+      if(window.__seen.size>antes){ stall=0; st('subiendo... ('+window.__seen.size+')'); info(''); return; }
+      pre=window.__seen.size; mode='down'; st('destrabando...'); return; }
+    if(mode==='down'){ rows[Math.min(rows.length-1,6)].scrollIntoView({block:'center'}); wheel(1); banner(); mode='up'; return; }
+    if(mode==='up'){ rows[0].scrollIntoView({block:'start'}); wheel(-1); capturar();
+      if(cargando()){ mode='wait'; wait=0; st('esperando al teléfono...'); return; }
+      if(window.__seen.size>pre){ stall=0; mode='normal'; st('subiendo... ('+window.__seen.size+')'); return; }
+      stall++; mode='normal'; st('reintentando ('+stall+'/'+MS+')');
+      if(stall>=MS) stop('✅ tope real ('+window.__seen.size+')','todo lo cargable'); return; }
+    if(mode==='wait'){ capturar();
+      if(window.__seen.size>pre){ stall=0; mode='normal'; st('subiendo... ('+window.__seen.size+')'); return; }
+      wait++; if((!cargando()&&wait>=3)||wait>=MW){ stall++; mode='normal';
+        if(stall>=MS) stop('✅ tope real ('+window.__seen.size+')','el teléfono ya no manda más'); } return; }
+  }catch(e){ st('tropecé, sigo'); mode='normal'; } }
+
+  document.getElementById('__waAutoBtn').onclick=function(){
+    if(!window.__lock){ window.__lock=titulo(); const l=document.getElementById('__waLock'); if(l) l.textContent='🔒 '+window.__lock; }
+    running=!running;
+    if(running){ mode='normal'; stall=0; window.__waAuto=setInterval(paso,1500); this.textContent='⏸ Pausar'; st('subiendo...'); }
+    else { clearInterval(window.__waAuto); this.textContent='▶ Auto-scroll'; st('pausado'); } };
+  document.getElementById('__waBtn').onclick=function(){
+    const blob=new Blob([window.__msgs.join('\n')],{type:'text/plain;charset=utf-8'});
+    const a=document.createElement('a'); a.href=URL.createObjectURL(blob);
+    a.download='chat_'+window.__seen.size+'.txt'; a.click(); st('descargado'); };
+  st('listo — '+(window.__lock?'candado en "'+window.__lock+'"':'abre el grupo y dale Auto-scroll'));
+})();
