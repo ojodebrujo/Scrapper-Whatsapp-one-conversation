@@ -1,0 +1,384 @@
+(function () {
+  // ─── RESET ────────────────────────────────────────────────────────────────────
+  ['__timer', '__waTimer', '__waAuto'].forEach(k => clearInterval(window[k]));
+  if (window.__waPanel) window.__waPanel.remove();
+
+  // ─── CONFIGURACIÓN (edita aquí) ───────────────────────────────────────────────
+  const CHUNK_SIZE  = 700;    // auto-descarga cada N mensajes
+  const CHUNK_OVERLAP = 20;   // cuántos msgs del chunk anterior repetir al inicio del siguiente
+  const LIMIT       = 3000;   // tope máximo de RAM antes de parar
+  const MAX_STALL   = 6;
+  const MAX_WAIT    = 10;
+
+  // Palabras clave de alerta (se detectan sin importar mayúsculas/minúsculas)
+  // Agrupa por nivel: 🔴 CRÍTICO, 🟠 ALTO, 🟡 PRECAUCIÓN
+  const KEYWORDS = {
+    '🔴 CRÍTICO':    ['asalto', 'asaltaron', 'asaltando', 'robo', 'robaron', 'robando',
+                      'rata', 'ratas', 'persiguiendo', 'perseguido', 'persiguen',
+                      'balacera', 'disparos', 'secuestro', 'secuestrado',
+                      'célula', 'delictiva', 'extorsion', 'extorsión'],
+    '🟠 ALTO':       ['accidente', 'choque', 'volcadura', 'volcó', 'voltio', 'volteó',
+                      '10-42', '1042', 'lesionado', 'herido', 'fallecido', 'muerto',
+                      'bloqueo', 'bloqueado', 'manifestantes', 'cierre'],
+    '🟡 PRECAUCIÓN': ['trafico', 'tráfico', 'lento', 'detenido', 'retén', 'reten',
+                      'precaución', 'precaucion', 'cuidado', 'peligro', 'obra']
+  };
+
+  // ─── ESTADO ───────────────────────────────────────────────────────────────────
+  window.__msgs     = [];       // todos los mensajes capturados
+  window.__alertas  = [];       // solo mensajes con keywords
+  window.__seen     = new Set();
+  window.__cf       = 0;
+  window.__sf       = 0;
+  window.__lastMeta = null;
+  window.__lock     = '';
+  window.__chunkN   = 0;        // número de chunk descargado
+  window.__lastChunkEnd = 0;    // índice donde terminó el último chunk (para overlap)
+
+  const RX_META = /^\[([^,\]]+),\s*([^\]]+)\]\s*(.*?):\s*$/;
+
+  // ─── HELPERS DOM ──────────────────────────────────────────────────────────────
+  function main()   { return document.querySelector('#main'); }
+  function titulo() {
+    const m = main(); if (!m) return '';
+    const h = m.querySelector('header');
+    return h ? (h.innerText || '').split('\n')[0].trim() : '';
+  }
+
+  // ─── EXTRAER METADATA ─────────────────────────────────────────────────────────
+  function getMeta(row) {
+    const el = row.matches('[data-pre-plain-text]')
+      ? row : row.querySelector('[data-pre-plain-text]');
+    if (!el) return null;
+    const raw = el.getAttribute('data-pre-plain-text') || '';
+    const m   = raw.match(RX_META);
+    if (!m) return null;
+    return { hora: m[1].trim(), fecha: m[2].trim(), remitente: m[3].trim() };
+  }
+
+  function makeKey(r, f, h, t) {
+    return `${r}|${f}|${h}|${t.slice(0, 80)}`;
+  }
+
+  // ─── DETECCIÓN DE ALERTAS ─────────────────────────────────────────────────────
+  function detectarAlerta(texto) {
+    const lower = texto.toLowerCase();
+    for (const [nivel, palabras] of Object.entries(KEYWORDS)) {
+      for (const palabra of palabras) {
+        if (lower.includes(palabra)) {
+          return { nivel, palabra };
+        }
+      }
+    }
+    return null;
+  }
+
+  // ─── DESCARGAR ARCHIVO ────────────────────────────────────────────────────────
+  function descargarTxt(lineas, nombre) {
+    const BOM  = '\uFEFF';
+    const blob = new Blob([BOM + lineas.join('\n')], { type: 'text/plain;charset=utf-8' });
+    const a    = document.createElement('a');
+    a.href     = URL.createObjectURL(blob);
+    a.download = nombre;
+    a.click();
+  }
+
+  // ─── AUTO-DESCARGA DE CHUNK ───────────────────────────────────────────────────
+  function autoDescarga() {
+    window.__chunkN++;
+    const n      = window.__chunkN;
+    const nombre = (window.__lock || 'wa').replace(/[^\w]/g, '_');
+
+    // Chunk de mensajes: incluye overlap de los últimos 20 del chunk anterior
+    const desde = Math.max(0, window.__lastChunkEnd - CHUNK_OVERLAP);
+    const chunk = [...window.__msgs].reverse().slice(desde);
+    window.__lastChunkEnd = window.__msgs.length;
+
+    const pad    = String(n).padStart(3, '0');
+    descargarTxt(chunk, `chat_${nombre}_parte${pad}.txt`);
+
+    // También descargar alertas del chunk si las hay
+    const alertasChunk = [...window.__alertas].reverse().filter((_, i) => i >= desde);
+    if (alertasChunk.length > 0) {
+      descargarTxt(alertasChunk, `alertas_${nombre}_parte${pad}.txt`);
+    }
+
+    st(`✅ chunk ${n} descargado (${chunk.length} msgs)`);
+    info(`alertas en este chunk: ${alertasChunk.length}`);
+
+    // Bip de notificación
+    try {
+      const ctx = new AudioContext();
+      const osc = ctx.createOscillator();
+      const g   = ctx.createGain();
+      osc.connect(g); g.connect(ctx.destination);
+      osc.frequency.value = 880;
+      g.gain.setValueAtTime(0.3, ctx.currentTime);
+      g.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.4);
+      osc.start(); osc.stop(ctx.currentTime + 0.4);
+    } catch (e) {}
+  }
+
+  // ─── CAPTURAR MENSAJES ────────────────────────────────────────────────────────
+  function capturar() {
+    try {
+      const m = main(); if (!m) { st('abre el chat primero'); return; }
+
+      if (window.__lock) {
+        const t = titulo();
+        if (t && t !== window.__lock) {
+          detener('⛔ cambió el chat — DETENIDO', 'Vuelve a "' + window.__lock + '"');
+          return;
+        }
+      }
+
+      const rows = m.querySelectorAll('div[role="row"]');
+      if (!rows.length) return;
+
+      const nuevos        = [];
+      const nuevasAlertas = [];
+
+      rows.forEach(row => {
+        try {
+          const meta = getMeta(row);
+          if (meta) window.__lastMeta = meta;
+
+          const texto = (row.innerText || '').trim();
+          if (!texto) return;
+
+          const usarMeta = window.__lastMeta || { fecha: '??', hora: '??', remitente: '??' };
+          const key      = makeKey(usarMeta.remitente, usarMeta.fecha, usarMeta.hora, texto);
+          if (window.__seen.has(key)) return;
+          window.__seen.add(key);
+
+          if (meta) { window.__cf++; } else { window.__sf++; }
+
+          const linea = `[${usarMeta.fecha}, ${usarMeta.hora}] ${usarMeta.remitente}: ${texto.replace(/\n+/g, ' · ')}`;
+          nuevos.push(linea);
+
+          // Detección de alerta
+          const alerta = detectarAlerta(texto);
+          if (alerta) {
+            const lineaAlerta = `${alerta.nivel} [keyword: "${alerta.palabra}"] ${linea}`;
+            nuevasAlertas.push(lineaAlerta);
+            window.__alertas.unshift(lineaAlerta);
+            // Flash en el panel
+            flashAlerta(alerta.nivel);
+          }
+        } catch (e) {}
+      });
+
+      if (nuevos.length) {
+        window.__msgs = nuevos.concat(window.__msgs);
+      }
+
+      actualizarUI();
+
+      // Auto-descarga cada CHUNK_SIZE
+      const anteriorChunk = Math.floor((window.__seen.size - nuevos.length) / CHUNK_SIZE);
+      const actualChunk   = Math.floor(window.__seen.size / CHUNK_SIZE);
+      if (actualChunk > anteriorChunk && window.__seen.size > 0) {
+        autoDescarga();
+      }
+
+      // Límite de RAM
+      if (window.__seen.size >= LIMIT) {
+        autoDescarga(); // descarga final antes de parar
+        detener('✅ límite ' + LIMIT + ' alcanzado — descargado', 'Reinicia el script para continuar');
+      }
+    } catch (e) {}
+  }
+
+  // ─── FLASH DE ALERTA EN PANEL ─────────────────────────────────────────────────
+  let flashTimeout = null;
+  function flashAlerta(nivel) {
+    const p = document.getElementById('__waPanel');
+    if (!p) return;
+    const color = nivel.includes('🔴') ? '#f00' : nivel.includes('🟠') ? '#f80' : '#ff0';
+    p.style.boxShadow = `0 0 20px 6px ${color}`;
+    clearTimeout(flashTimeout);
+    flashTimeout = setTimeout(() => {
+      p.style.boxShadow = '0 6px 24px rgba(0,0,0,.6)';
+    }, 2500);
+    // Actualizar contador de alertas
+    const el = document.getElementById('__waAlerts');
+    if (el) {
+      el.textContent = '🚨 Alertas: ' + window.__alertas.length;
+      el.style.color = color;
+    }
+  }
+
+  // ─── PANEL UI ─────────────────────────────────────────────────────────────────
+  const p = document.createElement('div');
+  p.id = '__waPanel'; window.__waPanel = p;
+  p.style.cssText = [
+    'position:fixed', 'top:80px', 'right:24px', 'z-index:2147483647',
+    'background:#111', 'color:#0f0', 'padding:16px', 'border-radius:12px',
+    'font-family:monospace', 'font-size:15px',
+    'box-shadow:0 6px 24px rgba(0,0,0,.6)', 'text-align:center', 'min-width:270px'
+  ].join(';');
+
+  p.innerHTML = `
+    <div id="__waLock"   style="font-size:11px;color:#6cf;margin-bottom:4px;">🔒 (sin chat)</div>
+    <div id="__waCount"  style="font-size:22px;font-weight:bold;">Capturados: 0</div>
+    <div id="__waLimit"  style="font-size:12px;color:#fa0;margin-bottom:2px;">0/${LIMIT} (0%)</div>
+    <div id="__waCF"     style="font-size:12px;color:#ff0;margin-bottom:4px;">Con fecha: 0 · Sin: 0</div>
+    <div id="__waAlerts" style="font-size:13px;color:#f80;margin-bottom:4px;">🚨 Alertas: 0</div>
+    <div id="__waChunk"  style="font-size:11px;color:#8cf;margin-bottom:6px;">Chunks: 0 de ~${Math.ceil(LIMIT/CHUNK_SIZE)}</div>
+    <div id="__waStatus" style="font-size:12px;color:#7f7;margin-bottom:4px;min-height:16px;">listo</div>
+    <div id="__waInfo"   style="font-size:11px;color:#999;margin-bottom:10px;min-height:20px;line-height:1.3;"></div>
+    <button id="__waAutoBtn" style="background:#06c;color:#fff;border:none;padding:10px 14px;border-radius:8px;font-size:14px;cursor:pointer;margin-bottom:6px;width:100%;">▶ Auto-scroll</button>
+    <button id="__waBtn"     style="background:#0a7;color:#fff;border:none;padding:10px 14px;border-radius:8px;font-size:14px;cursor:pointer;margin-bottom:6px;width:100%;">⬇ Descargar todo</button>
+    <button id="__waAlertBtn" style="background:#840;color:#fff;border:none;padding:8px 14px;border-radius:8px;font-size:13px;cursor:pointer;width:100%;">🚨 Descargar alertas</button>
+  `;
+  document.body.appendChild(p);
+
+  const st   = t => { const s = document.getElementById('__waStatus'); if (s) s.textContent = t; };
+  const info = t => { const s = document.getElementById('__waInfo');   if (s) s.textContent = t; };
+
+  function actualizarUI() {
+    const total = window.__seen.size;
+    const pct   = Math.round((total / LIMIT) * 100);
+
+    const c = document.getElementById('__waCount');
+    const l = document.getElementById('__waLimit');
+    const d = document.getElementById('__waCF');
+    const k = document.getElementById('__waChunk');
+
+    if (c) c.textContent = 'Capturados: ' + total;
+    if (l) {
+      l.textContent = `${total}/${LIMIT} (${pct}%)`;
+      l.style.color = pct > 80 ? '#f44' : pct > 50 ? '#f80' : '#fa0';
+    }
+    if (d) d.textContent = `Con fecha: ${window.__cf} · Sin: ${window.__sf}`;
+    if (k) k.textContent = `Chunks: ${window.__chunkN} · próximo en ${CHUNK_SIZE - (total % CHUNK_SIZE)} msgs`;
+  }
+
+  // ─── TIMER DE CAPTURA ─────────────────────────────────────────────────────────
+  window.__waTimer = setInterval(capturar, 600);
+
+  // ─── LÓGICA DE SCROLL ─────────────────────────────────────────────────────────
+  let running = false, mode = 'normal', stall = 0, wait = 0, pre = 0;
+
+  function wheel(dir) {
+    const m = main(); if (!m) return;
+    const el = m.querySelector('div[role="row"]'); if (!el) return;
+    (el.parentElement || el).dispatchEvent(
+      new WheelEvent('wheel', { deltaY: dir * 400, bubbles: true, cancelable: true })
+    );
+  }
+
+  function hayBanner() {
+    const m = main(); if (!m) return false;
+    const b = [...m.querySelectorAll('div[role="button"],button,span,div')]
+      .find(x => /mensajes anteriores|obtener mensajes|older messages|click here to get/i
+        .test((x.textContent || '').slice(0, 100)));
+    if (b) { b.click(); return true; } return false;
+  }
+
+  function estaCargando() {
+    const m = main(); return m ? !!m.querySelector('[role="progressbar"]') : false;
+  }
+
+  function detener(msg, extra) {
+    clearInterval(window.__waAuto);
+    running = false; mode = 'normal';
+    const b = document.getElementById('__waAutoBtn');
+    if (b) b.textContent = '▶ Auto-scroll';
+    st(msg); if (extra) info(extra);
+  }
+
+  function paso() {
+    try {
+      const m = main(); if (!m) { st('abre el chat'); return; }
+      const rows = m.querySelectorAll('div[role="row"]');
+      if (!rows.length) { st('no veo mensajes'); return; }
+
+      if (mode === 'normal') {
+        const antes = window.__seen.size;
+        rows[0].scrollIntoView({ block: 'start' });
+        capturar();
+        if (window.__seen.size > antes) {
+          stall = 0; st('subiendo… (' + window.__seen.size + ')'); info('');
+        } else {
+          pre = window.__seen.size; mode = 'down'; st('sin progreso, destrabando…');
+        }
+        return;
+      }
+
+      if (mode === 'down') {
+        const idx = Math.min(rows.length - 1, 8);
+        rows[idx].scrollIntoView({ block: 'center' });
+        wheel(1); hayBanner(); mode = 'up';
+        return;
+      }
+
+      if (mode === 'up') {
+        rows[0].scrollIntoView({ block: 'start' });
+        wheel(-1); capturar();
+        if (estaCargando()) { mode = 'wait'; wait = 0; st('esperando al teléfono…'); return; }
+        if (window.__seen.size > pre) { stall = 0; mode = 'normal'; st('subiendo… (' + window.__seen.size + ')'); return; }
+        stall++; mode = 'normal';
+        st('reintentando (' + stall + '/' + MAX_STALL + ')');
+        if (stall >= MAX_STALL) detener('✅ tope real (' + window.__seen.size + ')', 'No hay más mensajes');
+        return;
+      }
+
+      if (mode === 'wait') {
+        capturar();
+        if (window.__seen.size > pre) { stall = 0; wait = 0; mode = 'normal'; st('subiendo… (' + window.__seen.size + ')'); return; }
+        wait++;
+        st('esperando al teléfono… (' + wait + '/' + MAX_WAIT + ')');
+        if ((!estaCargando() && wait >= 3) || wait >= MAX_WAIT) {
+          wait = 0; stall++; mode = 'normal';
+          if (stall >= MAX_STALL) detener('✅ tope real (' + window.__seen.size + ')', 'El teléfono ya no manda más');
+        }
+        return;
+      }
+    } catch (e) { st('error en paso, reintentando'); mode = 'normal'; }
+  }
+
+  // ─── BOTÓN AUTO-SCROLL ────────────────────────────────────────────────────────
+  document.getElementById('__waAutoBtn').onclick = function () {
+    if (!window.__lock) {
+      window.__lock = titulo();
+      const l = document.getElementById('__waLock');
+      if (l) l.textContent = '🔒 ' + (window.__lock || '(sin nombre)');
+    }
+    running = !running;
+    if (running) {
+      mode = 'normal'; stall = 0; wait = 0;
+      window.__waAuto = setInterval(paso, 1500);
+      this.textContent = '⏸ Pausar'; st('subiendo…');
+    } else {
+      clearInterval(window.__waAuto);
+      this.textContent = '▶ Auto-scroll'; st('pausado');
+    }
+  };
+
+  // ─── BOTÓN DESCARGAR TODO ─────────────────────────────────────────────────────
+  document.getElementById('__waBtn').onclick = function () {
+    if (!window.__msgs.length) { st('nada que descargar aún'); return; }
+    const nombre = (window.__lock || 'wa').replace(/[^\w]/g, '_');
+    descargarTxt([...window.__msgs].reverse(), `chat_${nombre}_COMPLETO_${window.__seen.size}.txt`);
+    st('✅ completo descargado (' + window.__seen.size + ' msgs)');
+  };
+
+  // ─── BOTÓN DESCARGAR ALERTAS ──────────────────────────────────────────────────
+  document.getElementById('__waAlertBtn').onclick = function () {
+    if (!window.__alertas.length) { st('sin alertas detectadas aún'); return; }
+    const nombre = (window.__lock || 'wa').replace(/[^\w]/g, '_');
+    const header = [
+      '═══════════════════════════════════════',
+      `ALERTAS DETECTADAS — ${nombre}`,
+      `Total: ${window.__alertas.length} mensajes`,
+      `Generado: ${new Date().toLocaleString('es-MX')}`,
+      '═══════════════════════════════════════',
+      ''
+    ];
+    descargarTxt([...header, ...[...window.__alertas].reverse()], `alertas_${nombre}_${window.__alertas.length}.txt`);
+    st('🚨 alertas descargadas (' + window.__alertas.length + ')');
+  };
+
+  st('listo — abre el chat y dale ▶ Auto-scroll');
+})();
